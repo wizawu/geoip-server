@@ -8,7 +8,7 @@
 -author('wuhualiang@meituan.com').
 
 -mode(compile).
--export([init/1, start/2, worker/2]).
+-export([init/1, start/2, geoman/0, worker/2, snapshot/0]).
 
 -define(DEV, _).
 -ifdef(DEV).
@@ -18,6 +18,9 @@
 -export([invalid_ip/0]).
 -export([normal_ip/0]).
 -export([format/1]).
+-export([free_proc/1]).
+-export([ask_geoman/2]).
+-export([id_to_name/5]).
 -endif.
 
 -define(LOG_FILE, "logs").
@@ -27,14 +30,13 @@
 -define(GEO_TABLE, mt_geo).
 -define(GEO_MANAGER, geoman).
 -define(SNAPSHOT_INTV, 86400000).
--define(WRITEBACK_THR, 100000).
 -define(HIGH_WATER_MARK, 1000).
 
 init(careful) ->
     ets:new(?IPS_TABLE, [set, public, named_table]),
     ets:new(?GEO_TABLE, [set, public, named_table]),
     ets:insert(?IPS_TABLE, {count, 0}),
-    ets:insert(?GEO_TABLE, {{ips,      count}, 0}),
+    ets:insert(?GEO_TABLE, {{isp,      count}, 0}),
     ets:insert(?GEO_TABLE, {{country,  count}, 0}),
     ets:insert(?GEO_TABLE, {{province, count}, 0}),
     ets:insert(?GEO_TABLE, {{city,     count}, 0}),
@@ -46,15 +48,18 @@ init(careful) ->
     ok.
 
 start(Port, Procs) ->
+    register(?MODULE, self()),
     inets:start(),
-    error_logger:logfile({open, ?LOG_FILE}),
+    error_logger:logfile({open, ?LOG_FILE ++ time_suffix()}),
     {ok, ?IPS_TABLE} = ets:file2tab(?IPS_FILE),
     {ok, ?GEO_TABLE} = ets:file2tab(?GEO_FILE),
-    GeoMan = spawn(geoman),
+    GeoMan = spawn(?MODULE, geoman, []),
     register(?GEO_MANAGER, GeoMan),
-    lists:map(fun worker_init/1, [0, Procs-1]),
-    {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
-    loop(LSock, Procs).
+    lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
+    spawn(?MODULE, snapshot, []),
+    %{ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
+    %loop(LSock, Procs).
+    ok.
 
 %% ======== Internal Functions ======== %%
 
@@ -62,7 +67,8 @@ worker_init(X) when is_integer(X) ->
     Tid = ets:new(taskqueue, [set, public]),
     put({worker, X}, Tid),
     put({latest_task, X}, 0),
-    spawn(?MODULE, worker, [Tid, 1]).
+    Pid = spawn(?MODULE, worker, [Tid, 1]),
+    register(list_to_atom("mt_worker_" ++ integer_to_list(X)), Pid).
 
 worker(Tid, Todo) ->
     case ets:lookup(Tid, Todo) of
@@ -119,20 +125,27 @@ geoman() ->
                 [] ->
                     [{_, Count}] = ets:lookup(?GEO_TABLE, {Type, count}),
                     Id = Count + 1,
-                    ets:insert({{Type, Id}, Name}),
-                    ets:insert({{Type, Name}, Id}),
-                    ets:insert({{Type, count}, Id}),
+                    ets:insert(?GEO_TABLE, {{Type, Id}, Name}),
+                    ets:insert(?GEO_TABLE, {{Type, Name}, Id}),
+                    ets:insert(?GEO_TABLE, {{Type, count}, Id}),
+                    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
                     Pid ! Id
             end;
         _ -> pass
     end,
     geoman().
 
+ask_geoman(Type, Name) ->
+    case ets:lookup(?GEO_TABLE, {Type, Name}) of
+        [{_, Id}] -> Id;
+        [] ->
+            geoman ! {Type, Name, self()},
+            receive Id -> Id end
+    end.
+
 snapshot() ->
     timer:sleep(?SNAPSHOT_INTV),
-    {{Y, M, D}, {H, Mi, S}} = calendar:local_time(),
-    Suffix = "." ++ integer_to_list(Y * 10000 + M * 100 + D) ++
-             "-" ++ integer_to_list(H * 10000 + Mi * 100 + S),
+    Suffix = time_suffix(),
     ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
     ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
     snapshot().
@@ -173,22 +186,75 @@ lookup_ets(IP) ->
     {A, B, C, D} = inet:parse_ipv4_address(IP),
     Key = (A bsl 16) + (B bsl 8) + C,
     case ets:lookup(?IPS_TABLE, Key) of
-        [{Key, Value}] ->
+        [{_, Value}] ->
             L = 255 - D,
-            <<Flag:2, ISP:10, Country:8, Province:12, City:16,
+            <<_:2, ISP:10, Country:8, Province:12, City:16,
               County:16, _:L, X:1, _:D>> = Value,
             case X of
                 1 ->
                     Geo = id_to_name(ISP, Country, Province, City, County),
                     {200, format([IP | Geo])};
-                0 -> ok
+                0 ->
+                    case ets:lookup(?IPS_TABLE, (Key bsl 8) + D) of
+                        [{_, Value2}] ->
+                            <<_:2, ISP2:10, Country2:8, Province2:12, 
+                              City2:16, County2:16>> = Value2,
+                            Geo2 = id_to_name(ISP2, Country2, Province2,
+                                              City2, County2),
+                            {200, format([IP | Geo2])};
+                        [] -> taobao_api(IP)
+                    end
             end;
-        [] ->
-            case taobao_api(IP) of
-                ok -> lookup_ets(IP);
-                error -> invalid_ip()
-            end
+        [] -> taobao_api(IP)
     end.
+
+taobao_api(IP) ->
+    URL = "http://ip.taobao.com/service/getIpInfo.php?ip=" ++ IP,
+    case httpc:request(get, {URL, []}, [], [{full_result, false}]) of
+        {ok, {200, Json}} ->
+            Decoded = try
+                mochijson2:decode(Json)
+            catch
+                error: _Reason -> error
+            end,
+            case Decoded of
+                [{<<"code">>, 0}, {<<"data">>, Info}] ->
+                    {_, ISP} = lists:keyfind(<<"isp">>, 1, Info),
+                    {_, Country} = lists:keyfind(<<"country">>, 1, Info),
+                    {_, Province} = lists:keyfind(<<"region">>, 1, Info),
+                    {_, City} = lists:keyfind(<<"city">>, 1, Info),
+                    {_, County} = lists:keyfind(<<"county">>, 1, Info),
+                    save(IP, ISP, Country, Province, City, County),
+                    ok;
+                _ -> error
+            end;
+        _ -> error
+    end.
+
+save(IP, ISP, Country, Province, City, County) ->
+    ISP_id      = ask_geoman(isp, ISP),
+    Country_id  = ask_geoman(country, Country),
+    Province_id = ask_geoman(province, Province),
+    City_id     = ask_geoman(city, City),
+    County_id   = ask_geoman(county, County),
+    {ok, {A, B, C, D}} = inet:parse_ipv4_address(IP),
+    ok.
+
+http_response(Code, Json) ->
+    Status = case Code of
+        200 -> "HTTP/1.1 200 OK\r\nServer: Erlang\r\n";
+        400 -> "HTTP/1.1 BAD REQUEST\r\nServer: Erlang\r\n"
+    end,
+    {{Year, Month, Mday}, {Hour, Min, Sec}} = erlang:universaltime(),
+    Wday = calendar:day_of_the_week({Year, Month, Mday}),
+    Args = [lists:nth(Wday, weekdays()), Mday, lists:nth(Month, months()),
+            Year, Hour, Min, Sec],
+    Date = io_lib:format("Date: ~s, ~b ~s ~b ~b:~b:~b GMT\r\n", Args),
+    lists:concat([Status, Date,
+                  "Content-Type: application/json\r\n",
+                  "Transfer-Encoding: chunked\r\n",
+                  "Connection: close\r\n\r\n",
+                  Json]).
 
 id_to_name(ISP_id, Country_id, Province_id, City_id, County_id) ->
     [{_, ISP}]      = ets:lookup(?GEO_TABLE, {isp,      ISP_id}),
@@ -227,6 +293,13 @@ multicast_ip(IP) ->
 invalid_ip() ->
     {400, "{\"message\":\"Invalid IP\"}"}.
 
+time_suffix() ->
+    {{Y, M, D}, {H, Mi, S}} = erlang:localtime(),
+    Sfx1 = integer_to_list(Y * 10000 + M * 100 + D),
+    Sfx2 = integer_to_list(H * 10000 + Mi * 100 + S),
+    Pad = lists:duplicate(6 - length(Sfx2), $0), 
+    lists:concat(["-", Sfx1, "-", Pad, Sfx2]).
+
 months() ->
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].
@@ -234,47 +307,3 @@ months() ->
 weekdays() ->
     ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].
 
-http_response(Code, Json) ->
-    Status = case Code of
-        200 -> "HTTP/1.1 200 OK\r\nServer: Erlang\r\n";
-        400 -> "HTTP/1.1 BAD REQUEST\r\nServer: Erlang\r\n"
-    end,
-    {{Year, Month, Mday}, {Hour, Min, Sec}} = calendar:universal_time(),
-    Wday = calendar:day_of_the_week({Year, Month, Mday}),
-    Args = [lists:nth(Wday, weekdays()), Mday, lists:nth(Month, months()),
-            Year, Hour, Min, Sec],
-    Date = io_lib:format("Date: ~s, ~b ~s ~b ~b:~b:~b GMT\r\n", Args),
-    lists:concat([Status, Date,
-                  "Content-Type: application/json\r\n",
-                  "Transfer-Encoding: chunked\r\n",
-                  "Connection: close\r\n\r\n",
-                  Json]).
-
-
-save(IP, ISP, Country, Province, City, County) ->
-    {ok, {A, B, C, D}} = inet:parse_ipv4strict_address(IP),
-    Key = (A bsl 16) + (B bsl 8) + C,
-    ok.
-
-taobao_api(IP) ->
-    URL = "http://ip.taobao.com/service/getIpInfo.php?ip=" ++ IP,
-    case httpc:request(get, {URL, []}, [], [{full_result, false}]) of
-        {ok, {200, Json}} ->
-            Decoded = try
-                mochijson2:decode(Json)
-            catch
-                error: _Reason -> error
-            end,
-            case Decoded of
-                [{<<"code">>, 0}, {<<"data">>, Info}] ->
-                    {_, ISP} = lists:keyfind(<<"isp">>, 1, Info),
-                    {_, Country} = lists:keyfind(<<"country">>, 1, Info),
-                    {_, Province} = lists:keyfind(<<"region">>, 1, Info),
-                    {_, City} = lists:keyfind(<<"city">>, 1, Info),
-                    {_, County} = lists:keyfind(<<"county">>, 1, Info),
-                    save(IP, ISP, Country, Province, City, County),
-                    ok;
-                _ -> error
-            end;
-        _ -> error
-    end.
