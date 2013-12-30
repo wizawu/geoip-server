@@ -21,6 +21,8 @@
 -export([free_proc/1]).
 -export([ask_geoman/2]).
 -export([id_to_name/5]).
+-export([lookup/1]).
+-export([lookup_ets/1]).
 -endif.
 
 -define(LOG_FILE, "logs").
@@ -57,9 +59,9 @@ start(Port, Procs) ->
     register(?GEO_MANAGER, GeoMan),
     lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
     spawn(?MODULE, snapshot, []),
-    %{ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
-    %loop(LSock, Procs).
-    ok.
+    {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
+    loop(LSock, Procs),
+    never_get_here.
 
 %% ======== Internal Functions ======== %%
 
@@ -73,13 +75,13 @@ worker_init(X) when is_integer(X) ->
 worker(Tid, Todo) ->
     case ets:lookup(Tid, Todo) of
         [{_, Sock}] ->
-            case gen_tcp:recv(Sock, 0, 4000) of
+            case gen_tcp:recv(Sock, 0, 200) of
                 {ok, {http_request, 'GET', {abs_path, Path}, _}} ->
                     case Path of
                         "/api/ip/get/" ++ IP ->
                             {Code, Json} = lookup(IP),
                             Response = http_response(Code, Json),
-                            inet:setopts(Sock, {send_timeout, 4000}),
+                            inet:setopts(Sock, {send_timeout, 200}),
                             gen_tcp:send(Sock, Response);
                         _ -> pass
                     end;
@@ -186,19 +188,19 @@ lookup_ets(IP) ->
     {A, B, C, D} = inet:parse_ipv4_address(IP),
     Key = (A bsl 16) + (B bsl 8) + C,
     case ets:lookup(?IPS_TABLE, Key) of
-        [{_, Value}] ->
+        [{_, Val}] ->
             L = 255 - D,
             <<_:2, ISP:10, Country:8, Province:12, City:16,
-              County:16, _:L, X:1, _:D>> = Value,
+              County:16, _:L, X:1, _:D>> = Val,
             case X of
                 1 ->
                     Geo = id_to_name(ISP, Country, Province, City, County),
                     {200, format([IP | Geo])};
                 0 ->
                     case ets:lookup(?IPS_TABLE, (Key bsl 8) + D) of
-                        [{_, Value2}] ->
+                        [{_, Val2}] ->
                             <<_:2, ISP2:10, Country2:8, Province2:12, 
-                              City2:16, County2:16>> = Value2,
+                              City2:16, County2:16>> = Val2,
                             Geo2 = id_to_name(ISP2, Country2, Province2,
                                               City2, County2),
                             {200, format([IP | Geo2])};
@@ -224,21 +226,45 @@ taobao_api(IP) ->
                     {_, Province} = lists:keyfind(<<"region">>, 1, Info),
                     {_, City} = lists:keyfind(<<"city">>, 1, Info),
                     {_, County} = lists:keyfind(<<"county">>, 1, Info),
-                    save(IP, ISP, Country, Province, City, County),
-                    ok;
-                _ -> error
+                    All = [IP, ISP, Country, Province, City, County],
+                    save(All),
+                    {200, format(All)};
+                _ -> invalid_ip()
             end;
-        _ -> error
+        _ -> invalid_ip()
     end.
 
-save(IP, ISP, Country, Province, City, County) ->
-    ISP_id      = ask_geoman(isp, ISP),
-    Country_id  = ask_geoman(country, Country),
-    Province_id = ask_geoman(province, Province),
-    City_id     = ask_geoman(city, City),
-    County_id   = ask_geoman(county, County),
+save([IP, ISP, Country, Province, City, County]) ->
+    ISP_id  = ask_geoman(isp, ISP),
+    Cntr_id = ask_geoman(country, Country),
+    Prvn_id = ask_geoman(province, Province),
+    City_id = ask_geoman(city, City),
+    Cnt_id  = ask_geoman(county, County),
+    GeoBin = <<0:2, ISP_id:10, Cntr_id:8, Prvn_id:12, City_id:16, Cnt_id:16>>,
     {ok, {A, B, C, D}} = inet:parse_ipv4_address(IP),
-    ok.
+    Key = (A bsl 16) + (B bsl 8) + C,
+    L = 255 - D,
+    case ets:lookup(?IPS_TABLE, Key) of
+        [{_, <<GeoBin:64/bits, BM1:L/bits, X:1, BM2:D/bits>>}] ->
+            case X of
+                1 -> pass;
+                0 ->
+                    Val = <<GeoBin/bits, BM1/bits, 1:1, BM2/bits>>,
+                    ets:insert(?IPS_TABLE, {Key, Val}),
+                    incr_ips_count()
+            end;
+        [_] ->
+            ets:insert(?IPS_TABLE, {Key*256 + D, GeoBin}),
+            incr_ips_count();
+        [] ->
+            Val = <<GeoBin/bits, 0:L, 1:1, 0:D>>,
+            ets:insert(?IPS_TABLE, {Key, Val}),
+            incr_ips_count()
+    end.
+
+incr_ips_count() ->
+    [{_, Count}] = ets:lookup(?IPS_TABLE, count),
+    ets:insert(?IPS_TABLE, {count, Count + 1}).
 
 http_response(Code, Json) ->
     Status = case Code of
