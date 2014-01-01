@@ -153,6 +153,7 @@ snapshot() ->
     Suffix = time_suffix(),
     ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
     ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
+    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
     snapshot().
 
 lookup(IP) when is_list(IP) ->
