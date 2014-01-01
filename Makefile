@@ -1,10 +1,9 @@
 .PHONY: all clean
 
 dir = ebin
-beam = geoip.beam mochijson2.beam
 
-all:
-	erlc -smp +native -o $(dir) geoip.erl mochijson2.erl
+all: geoip.erl mochijson2.erl
+	erlc -W -smp +native -o $(dir) $^
 
 clean:
-	-cd $(dir) && rm $(beam)
+	-cd $(dir) && rm *.beam

@@ -5,22 +5,11 @@
 -module(geoip).
 -author('wizawu@gmail.com').
 
--mode(compile).
--export([init/1, start/1, geoman/0, worker/2, snapshot/0]).
-
 -define(DEV, _).
 -ifdef(DEV).
--export([http_response/2]).
--export([special_ip/1]).
--export([multicast_ip/1]).
--export([invalid_ip/0]).
--export([normal_ip/0]).
--export([format/1]).
--export([free_proc/1]).
--export([ask_geoman/2]).
--export([id_to_name/5]).
--export([lookup/1]).
--export([lookup_ets/1]).
+-compile([export_all]).
+-else.
+-export([init/1, start/1, geoman/0, worker/2, snapshot/0]).
 -endif.
 
 -define(LOG_FILE, "logs/logs").
@@ -53,6 +42,9 @@ init([careful]) ->
 start([_Port, _Procs]) when is_list(_Port), is_list(_Procs) ->
     Port = list_to_integer(_Port),
     Procs = list_to_integer(_Procs),
+    start(Port, Procs).
+
+start(Port, Procs) ->
     register(?MODULE, self()),
     inets:start(),
     error_logger:logfile({open, ?LOG_FILE ++ time_suffix()}),
@@ -64,6 +56,7 @@ start([_Port, _Procs]) when is_list(_Port), is_list(_Procs) ->
     lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
     spawn(?MODULE, snapshot, []),
     {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
+    inet:setopts(LSock, [{send_timeout, 200}]),
     loop(LSock, Procs),
     never_get_here.
 
@@ -85,7 +78,6 @@ worker(Tid, Todo) ->
                         "/api/ip/get/" ++ IP ->
                             {Code, Json} = lookup(IP),
                             Response = http_response(Code, Json),
-                            inet:setopts(Sock, {send_timeout, 200}),
                             gen_tcp:send(Sock, Response);
                         _ -> pass
                     end;
@@ -191,7 +183,7 @@ lookup(IP) when is_list(IP) ->
 %% ------+-----+---------+----------+------+--------+--------
 %%  flag | ISP | country | province | city | county | bitmap
 lookup_ets(IP) ->
-    {A, B, C, D} = inet:parse_ipv4_address(IP),
+    {ok, {A, B, C, D}} = inet:parse_ipv4_address(IP),
     Key = (A bsl 16) + (B bsl 8) + C,
     case ets:lookup(?IPS_TABLE, Key) of
         [{_, Val}] ->
@@ -221,7 +213,7 @@ taobao_api(IP) ->
     case httpc:request(get, {URL, []}, [], [{full_result, false}]) of
         {ok, {200, Json}} ->
             Decoded = try
-                mochijson2:decode(Json)
+                mochijson2:decode(Json, [{format, proplist}])
             catch
                 error: _Reason -> error
             end,
@@ -275,7 +267,7 @@ incr_ips_count() ->
 http_response(Code, Json) ->
     Status = case Code of
         200 -> "HTTP/1.1 200 OK\r\nServer: Erlang\r\n";
-        400 -> "HTTP/1.1 BAD REQUEST\r\nServer: Erlang\r\n"
+        400 -> "HTTP/1.1 400 BAD REQUEST\r\nServer: Erlang\r\n"
     end,
     {{Year, Month, Mday}, {Hour, Min, Sec}} = erlang:universaltime(),
     Wday = calendar:day_of_the_week({Year, Month, Mday}),
@@ -284,7 +276,7 @@ http_response(Code, Json) ->
     Date = io_lib:format("Date: ~s, ~b ~s ~b ~b:~b:~b GMT\r\n", Args),
     lists:concat([Status, Date,
                   "Content-Type: application/json\r\n",
-                  "Transfer-Encoding: chunked\r\n",
+                % "Transfer-Encoding: chunked\r\n",
                   "Connection: close\r\n\r\n",
                   Json]).
 
@@ -298,11 +290,23 @@ id_to_name(ISP_id, Country_id, Province_id, City_id, County_id) ->
 
 format(Args) when is_list(Args) ->
     % [IP, ISP, Country, Province, City, County] = Args
-    io_lib:format(normal_ip(), Args).
+    Unicode = io_lib:format(normal_ip(), Args),
+    backslash_u(lists:flatten(Unicode)).
+
+backslash_u(L) -> backslash_u(lists:reverse(L), []).
+backslash_u([], L) -> L;
+backslash_u([H|T], L) ->
+    if H < 128 ->
+        backslash_u(T, [H|L]);
+    true ->
+        X = "0000" ++ lists:nth(1, io_lib:format("~.16b", [H])),
+        [A, B, C, D] = lists:sublist(X, length(X)-3, 4),
+        backslash_u(T, [$\\, $u, A, B, C, D | L])
+    end.
 
 normal_ip() ->
-    "{\"ip\":\"~s\", \"isp\":\"~s\", \"country\":\"~s\"," ++
-    "\"province\":\"~s\", \"city\":\"~s\", \"county\":\"~s\"}".
+    "{\"ip\":\"~s\", \"isp\":\"~ts\", \"country\":\"~ts\"," ++
+    "\"province\":\"~ts\", \"city\":\"~ts\", \"county\":\"~ts\"}".
 
 special_ip(IP) ->
     Json = "{\"province\":\"https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml\"," ++
