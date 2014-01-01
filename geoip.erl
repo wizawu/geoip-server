@@ -1,14 +1,12 @@
-%%! -smp auto +K true
-
 %%================================
 %% Geographic IP Informatin Server
 %%================================
 
 -module(geoip).
--author('wuhualiang@meituan.com').
+-author('wizawu@gmail.com').
 
 -mode(compile).
--export([init/1, start/2, geoman/0, worker/2, snapshot/0]).
+-export([init/1, start/1, geoman/0, worker/2, snapshot/0]).
 
 -define(DEV, _).
 -ifdef(DEV).
@@ -25,16 +23,16 @@
 -export([lookup_ets/1]).
 -endif.
 
--define(LOG_FILE, "logs").
--define(IPS_FILE, "ips.dump").
--define(GEO_FILE, "geo.meta").
+-define(LOG_FILE, "logs/logs").
+-define(IPS_FILE, "data/ips.dump").
+-define(GEO_FILE, "data/geo.meta").
 -define(IPS_TABLE, mt_ips).
 -define(GEO_TABLE, mt_geo).
 -define(GEO_MANAGER, geoman).
 -define(SNAPSHOT_INTV, 86400000).
 -define(HIGH_WATER_MARK, 1000).
 
-init(careful) ->
+init([careful]) ->
     ets:new(?IPS_TABLE, [set, public, named_table]),
     ets:new(?GEO_TABLE, [set, public, named_table]),
     ets:insert(?IPS_TABLE, {count, 0}),
@@ -43,18 +41,24 @@ init(careful) ->
     ets:insert(?GEO_TABLE, {{province, count}, 0}),
     ets:insert(?GEO_TABLE, {{city,     count}, 0}),
     ets:insert(?GEO_TABLE, {{county,   count}, 0}),
-    ets:tab2file(?IPS_TABLE, ?IPS_FILE),
+    Suffix = time_suffix(),
+    ets:insert(?GEO_TABLE, {?IPS_TABLE, ?IPS_FILE ++ Suffix}),
+    ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
+    ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
     ets:tab2file(?GEO_TABLE, ?GEO_FILE),
     ets:delete(?IPS_TABLE),
     ets:delete(?GEO_TABLE),
     ok.
 
-start(Port, Procs) ->
+start([_Port, _Procs]) when is_list(_Port), is_list(_Procs) ->
+    Port = list_to_integer(_Port),
+    Procs = list_to_integer(_Procs),
     register(?MODULE, self()),
     inets:start(),
     error_logger:logfile({open, ?LOG_FILE ++ time_suffix()}),
-    {ok, ?IPS_TABLE} = ets:file2tab(?IPS_FILE),
     {ok, ?GEO_TABLE} = ets:file2tab(?GEO_FILE),
+    [{_, Filename}] = ets:lookup(?GEO_TABLE, ?IPS_TABLE),
+    {ok, ?IPS_TABLE} = ets:file2tab(Filename),
     GeoMan = spawn(?MODULE, geoman, []),
     register(?GEO_MANAGER, GeoMan),
     lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
@@ -88,6 +92,7 @@ worker(Tid, Todo) ->
                 _ -> pass
             end,
             gen_tcp:close(Sock),
+            ets:delete(Tid, Todo),
             worker(Tid, Todo + 1);
         [] ->
             timer:sleep(1),
@@ -127,7 +132,8 @@ geoman() ->
                 [] ->
                     [{_, Count}] = ets:lookup(?GEO_TABLE, {Type, count}),
                     Id = Count + 1,
-                    ets:insert(?GEO_TABLE, {{Type, Id}, Name}),
+                    IdType = list_to_atom(atom_to_list(Type) ++ "_id"),
+                    ets:insert(?GEO_TABLE, {{IdType, Id}, Name}),
                     ets:insert(?GEO_TABLE, {{Type, Name}, Id}),
                     ets:insert(?GEO_TABLE, {{Type, count}, Id}),
                     ets:tab2file(?GEO_TABLE, ?GEO_FILE),
@@ -283,11 +289,11 @@ http_response(Code, Json) ->
                   Json]).
 
 id_to_name(ISP_id, Country_id, Province_id, City_id, County_id) ->
-    [{_, ISP}]      = ets:lookup(?GEO_TABLE, {isp,      ISP_id}),
-    [{_, Country}]  = ets:lookup(?GEO_TABLE, {country,  Country_id}),
-    [{_, Province}] = ets:lookup(?GEO_TABLE, {province, Province_id}),
-    [{_, City}]     = ets:lookup(?GEO_TABLE, {city,     City_id}),
-    [{_, County}]   = ets:lookup(?GEO_TABLE, {county,   County_id}),
+    [{_, ISP}]      = ets:lookup(?GEO_TABLE, {isp_id,      ISP_id}),
+    [{_, Country}]  = ets:lookup(?GEO_TABLE, {country_id,  Country_id}),
+    [{_, Province}] = ets:lookup(?GEO_TABLE, {province_id, Province_id}),
+    [{_, City}]     = ets:lookup(?GEO_TABLE, {city_id,     City_id}),
+    [{_, County}]   = ets:lookup(?GEO_TABLE, {county_id,   County_id}),
     [ISP, Country, Province, City, County].
 
 format(Args) when is_list(Args) ->
