@@ -18,8 +18,13 @@
 -define(IPS_TABLE, mt_ips).
 -define(GEO_TABLE, mt_geo).
 -define(GEO_MANAGER, geoman).
--define(SNAPSHOT_INTV, 86400000).
 -define(HIGH_WATER_MARK, 1000).
+
+-ifdef(DEV).
+-define(SNAPSHOT_INTV, 864000).
+-else.
+-define(SNAPSHOT_INTV, 86400000).
+-endif.
 
 init([careful]) ->
     ets:new(?IPS_TABLE, [set, public, named_table]),
@@ -128,7 +133,7 @@ geoman() ->
                     ets:insert(?GEO_TABLE, {{IdType, Id}, Name}),
                     ets:insert(?GEO_TABLE, {{Type, Name}, Id}),
                     ets:insert(?GEO_TABLE, {{Type, count}, Id}),
-                    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
+                  % ets:tab2file(?GEO_TABLE, ?GEO_FILE),
                     Pid ! Id
             end;
         _ -> pass
