@@ -10,6 +10,7 @@
 -compile([export_all]).
 -else.
 -export([init/1, start/1, geoman/0, worker/2, snapshot/0]).
+-export([csv_import/1]).
 -endif.
 
 -define(LOG_FILE, "logs/logs").
@@ -263,6 +264,33 @@ save([IP, ISP, Country, Province, City, County]) ->
             Val = <<GeoBin/bits, 0:L, 1:1, 0:D>>,
             ets:insert(?IPS_TABLE, {Key, Val}),
             incr_ips_count()
+    end.
+
+csv_import(Filename) ->
+    {ok, Fd} = file:open(Filename, [raw, read, {read_ahead, 4096}]),
+    file:read_line(Fd),
+    csv_import(Fd, 0).
+csv_import(Fd, Count) ->
+    case file:read_line(Fd) of
+        {ok, Line} ->
+            [S, G, H, J, K, L] = string:tokens(Line, ",\n"),
+            X = list_to_integer(S), 
+            <<A, B, C, D>> = <<X:32/integer>>,
+            IP = lists:flatten(io_lib:format("~b.~b.~b.~b", [A, B, C, D])),
+            Clean = fun(Q) ->
+                NQ = list_to_binary(lists:sublist(Q, 2, length(Q)-2)),
+                lists:flatten(io_lib:format("~ts", [NQ]))
+            end,
+            ISP = Clean(G),
+            Country = Clean(H),
+            Province = Clean(J),
+            City = Clean(K),
+            County = Clean(L),
+            Args = [IP, ISP, Country, Province, City, County],
+            save(Args),
+            io:fwrite("~b ~s ~ts ~ts ~ts ~ts ~ts~n", [Count | Args]),
+            csv_import(Fd, Count + 1);
+        Err -> Err
     end.
 
 incr_ips_count() ->
