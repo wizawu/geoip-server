@@ -18,7 +18,7 @@
 -define(IPS_TABLE, mt_ips).
 -define(GEO_TABLE, mt_geo).
 -define(GEO_MANAGER, geoman).
--define(HIGH_WATER_MARK, 1000).
+-define(HIGH_WATER_MARK, 100).
 
 -ifdef(DEV).
 -define(SNAPSHOT_INTV, 864000).
@@ -133,7 +133,6 @@ geoman() ->
                     ets:insert(?GEO_TABLE, {{IdType, Id}, Name}),
                     ets:insert(?GEO_TABLE, {{Type, Name}, Id}),
                     ets:insert(?GEO_TABLE, {{Type, count}, Id}),
-                  % ets:tab2file(?GEO_TABLE, ?GEO_FILE),
                     Pid ! Id
             end;
         _ -> pass
@@ -185,17 +184,17 @@ lookup(IP) when is_list(IP) ->
     end.
 
 %% mt_ips value format:
-%%     2 |  10 |       8 |       12 |   16 |     16 |    256
-%% ------+-----+---------+----------+------+--------+--------
-%%  flag | ISP | country | province | city | county | bitmap
+%%   12 |       8 |       12 |   16 |     16 |    256
+%% -----+---------+----------+------+--------+--------
+%%  ISP | country | province | city | county | bitmap
 lookup_ets(IP) ->
     {ok, {A, B, C, D}} = inet:parse_ipv4_address(IP),
     Key = (A bsl 16) + (B bsl 8) + C,
     case ets:lookup(?IPS_TABLE, Key) of
         [{_, Val}] ->
             L = 255 - D,
-            <<_:2, ISP:10, Country:8, Province:12, City:16,
-              County:16, _:L, X:1, _:D>> = Val,
+            <<ISP:12, Country:8, Province:12, City:16, County:16,
+              _:L, X:1, _:D>> = Val,
             case X of
                 1 ->
                     Geo = id_to_name(ISP, Country, Province, City, County),
@@ -203,7 +202,7 @@ lookup_ets(IP) ->
                 0 ->
                     case ets:lookup(?IPS_TABLE, (Key bsl 8) + D) of
                         [{_, Val2}] ->
-                            <<_:2, ISP2:10, Country2:8, Province2:12, 
+                            <<ISP2:12, Country2:8, Province2:12,
                               City2:16, County2:16>> = Val2,
                             Geo2 = id_to_name(ISP2, Country2, Province2,
                                               City2, County2),
@@ -244,7 +243,7 @@ save([IP, ISP, Country, Province, City, County]) ->
     Prvn_id = ask_geoman(province, Province),
     City_id = ask_geoman(city, City),
     Cnt_id  = ask_geoman(county, County),
-    GeoBin = <<0:2, ISP_id:10, Cntr_id:8, Prvn_id:12, City_id:16, Cnt_id:16>>,
+    GeoBin = <<ISP_id:12, Cntr_id:8, Prvn_id:12, City_id:16, Cnt_id:16>>,
     {ok, {A, B, C, D}} = inet:parse_ipv4_address(IP),
     Key = (A bsl 16) + (B bsl 8) + C,
     L = 255 - D,
@@ -316,7 +315,7 @@ normal_ip() ->
 
 special_ip(IP) ->
     Json = "{\"province\":\"https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml\"," ++
-           "\"city\":\"\"," ++ 
+           "\"city\":\"\"," ++
            "\"ip\":\"" ++ IP ++ "\"," ++
            "\"isp\":\"\"," ++
            "\"county\":\"\"," ++
@@ -325,7 +324,7 @@ special_ip(IP) ->
 
 multicast_ip(IP) ->
     Json = "{\"province\":\"https://www.iana.org/assignments/multicast-addresses/multicast-addresses.xhtml\"," ++
-           "\"city\":\"\"," ++ 
+           "\"city\":\"\"," ++
            "\"ip\":\"" ++ IP ++ "\"," ++
            "\"isp\":\"\"," ++
            "\"county\":\"\"," ++
@@ -339,7 +338,7 @@ time_suffix() ->
     {{Y, M, D}, {H, Mi, S}} = erlang:localtime(),
     Sfx1 = integer_to_list(Y * 10000 + M * 100 + D),
     Sfx2 = integer_to_list(H * 10000 + Mi * 100 + S),
-    Pad = lists:duplicate(6 - length(Sfx2), $0), 
+    Pad = lists:duplicate(6 - length(Sfx2), $0),
     lists:concat(["-", Sfx1, "-", Pad, Sfx2]).
 
 months() ->
