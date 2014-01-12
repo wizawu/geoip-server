@@ -61,7 +61,8 @@ start(Port, Procs) ->
     register(?GEO_MANAGER, GeoMan),
     lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
     spawn(?MODULE, snapshot, []),
-    {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http}]),
+    {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http},
+                                        {reuseaddr, true}]),
     inet:setopts(LSock, [{send_timeout, 200}]),
     loop(LSock, Procs),
     never_get_here.
@@ -152,6 +153,7 @@ snapshot() ->
     timer:sleep(?SNAPSHOT_INTV),
     Suffix = time_suffix(),
     ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
+    ets:insert(?GEO_TABLE, {?IPS_TABLE, ?IPS_FILE ++ Suffix}),
     ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
     ets:tab2file(?GEO_TABLE, ?GEO_FILE),
     snapshot().
