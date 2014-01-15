@@ -22,7 +22,7 @@
 -define(HIGH_WATER_MARK, 100).
 
 -ifdef(DEV).
--define(SNAPSHOT_INTV, 864000).
+-define(SNAPSHOT_INTV, 600000).
 -else.
 -define(SNAPSHOT_INTV, 86400000).
 -endif.
@@ -36,15 +36,12 @@ init([careful]) ->
     ets:insert(?GEO_TABLE, {{province, count}, 0}),
     ets:insert(?GEO_TABLE, {{city,     count}, 0}),
     ets:insert(?GEO_TABLE, {{county,   count}, 0}),
-    Suffix = time_suffix(),
-    ets:insert(?GEO_TABLE, {?IPS_TABLE, ?IPS_FILE ++ Suffix}),
-    ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
-    ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
-    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
+    snapshot_now(),
     ets:delete(?IPS_TABLE),
     ets:delete(?GEO_TABLE),
     ok.
 
+%% Used to start from command line
 start([_Port, _Procs]) when is_list(_Port), is_list(_Procs) ->
     Port = list_to_integer(_Port),
     Procs = list_to_integer(_Procs),
@@ -54,13 +51,18 @@ start(Port, Procs) ->
     register(?MODULE, self()),
     inets:start(),
     error_logger:logfile({open, ?LOG_FILE ++ time_suffix()}),
+    % load tables
     {ok, ?GEO_TABLE} = ets:file2tab(?GEO_FILE),
     [{_, Filename}] = ets:lookup(?GEO_TABLE, ?IPS_TABLE),
     {ok, ?IPS_TABLE} = ets:file2tab(Filename),
+    % start geoman
     GeoMan = spawn(?MODULE, geoman, []),
     register(?GEO_MANAGER, GeoMan),
+    % start workers
     lists:map(fun worker_init/1, lists:seq(0, Procs-1)),
+    % start snapshot process
     spawn(?MODULE, snapshot, []),
+    % start http server
     {ok, LSock} = gen_tcp:listen(Port, [{active, false}, {packet, http},
                                         {reuseaddr, true}]),
     inet:setopts(LSock, [{send_timeout, 200}]),
@@ -68,6 +70,34 @@ start(Port, Procs) ->
     never_get_here.
 
 %% ======== Internal Functions ======== %%
+
+loop(LSock, Procs) ->
+    {ok, Sock} = gen_tcp:accept(LSock),
+    {X, Tid} = free_proc(Procs),
+    Task = get({latest_task, X}) + 1,
+    put({latest_task, X}, Task),
+    ets:insert(Tid, {Task, Sock}),
+    loop(LSock, Procs).
+
+%% Return next task number and task table of an available process
+free_proc(Procs) -> free_proc(Procs, 1).
+
+free_proc(Procs, Tried) ->
+    {_, _, Y} = erlang:now(),
+    X = Y rem Procs,
+    Tid = get({worker, X}),
+    Size = ets:info(Tid, size),
+    if Size < ?HIGH_WATER_MARK ->
+        {X, Tid};
+    true ->
+        if Procs == Tried ->
+            {X, Tid};
+        true ->
+            free_proc(Procs, Tried + 1)
+        end
+    end.
+
+%% ======== worker ======== %%
 
 worker_init(X) when is_integer(X) ->
     Tid = ets:new(taskqueue, [set, public]),
@@ -98,29 +128,7 @@ worker(Tid, Todo) ->
             worker(Tid, Todo)
     end.
 
-loop(LSock, Procs) ->
-    {ok, Sock} = gen_tcp:accept(LSock),
-    {X, Tid} = free_proc(Procs),
-    Task = get({latest_task, X}) + 1,
-    put({latest_task, X}, Task),
-    ets:insert(Tid, {Task, Sock}),
-    loop(LSock, Procs).
-
-free_proc(Procs) -> free_proc(Procs, 1).
-free_proc(Procs, Tried) ->
-    {_, _, Y} = erlang:now(),
-    X = Y rem Procs,
-    Tid = get({worker, X}),
-    Size = ets:info(Tid, size),
-    if Size < ?HIGH_WATER_MARK ->
-        {X, Tid};
-    true ->
-        if Procs == Tried ->
-            {X, Tid};
-        true ->
-            free_proc(Procs, Tried + 1)
-        end
-    end.
+%% ======== GeoMan ======== %%
 
 geoman() ->
     receive
@@ -149,14 +157,7 @@ ask_geoman(Type, Name) ->
             receive Id -> Id end
     end.
 
-snapshot() ->
-    timer:sleep(?SNAPSHOT_INTV),
-    Suffix = time_suffix(),
-    ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
-    ets:insert(?GEO_TABLE, {?IPS_TABLE, ?IPS_FILE ++ Suffix}),
-    ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
-    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
-    snapshot().
+%% ======== ets operations ======== %%
 
 lookup(IP) when is_list(IP) ->
     case inet:parse_ipv4strict_address(IP) of
@@ -216,29 +217,13 @@ lookup_ets(IP) ->
         [] -> taobao_api(IP)
     end.
 
-taobao_api(IP) ->
-    URL = "http://ip.taobao.com/service/getIpInfo.php?ip=" ++ IP,
-    case httpc:request(get, {URL, []}, [], [{full_result, false}]) of
-        {ok, {200, Json}} ->
-            Decoded = try
-                mochijson2:decode(Json, [{format, proplist}])
-            catch
-                error: _Reason -> error
-            end,
-            case Decoded of
-                [{<<"code">>, 0}, {<<"data">>, Info}] ->
-                    {_, ISP} = lists:keyfind(<<"isp">>, 1, Info),
-                    {_, Country} = lists:keyfind(<<"country">>, 1, Info),
-                    {_, Province} = lists:keyfind(<<"region">>, 1, Info),
-                    {_, City} = lists:keyfind(<<"city">>, 1, Info),
-                    {_, County} = lists:keyfind(<<"county">>, 1, Info),
-                    All = [IP, ISP, Country, Province, City, County],
-                    save(All),
-                    {200, format(All)};
-                _ -> invalid_ip()
-            end;
-        _ -> invalid_ip()
-    end.
+id_to_name(ISP_id, Country_id, Province_id, City_id, County_id) ->
+    [{_, ISP}]      = ets:lookup(?GEO_TABLE, {isp_id,      ISP_id}),
+    [{_, Country}]  = ets:lookup(?GEO_TABLE, {country_id,  Country_id}),
+    [{_, Province}] = ets:lookup(?GEO_TABLE, {province_id, Province_id}),
+    [{_, City}]     = ets:lookup(?GEO_TABLE, {city_id,     City_id}),
+    [{_, County}]   = ets:lookup(?GEO_TABLE, {county_id,   County_id}),
+    [ISP, Country, Province, City, County].
 
 save([IP, ISP, Country, Province, City, County]) ->
     ISP_id  = ask_geoman(isp, ISP),
@@ -268,36 +253,52 @@ save([IP, ISP, Country, Province, City, County]) ->
             incr_ips_count()
     end.
 
-csv_import(Filename) ->
-    {ok, Fd} = file:open(Filename, [raw, read, {read_ahead, 4096}]),
-    file:read_line(Fd),
-    csv_import(Fd, 0).
-csv_import(Fd, Count) ->
-    case file:read_line(Fd) of
-        {ok, Line} ->
-            [S, G, H, J, K, L] = string:tokens(Line, ",\n"),
-            X = list_to_integer(S), 
-            <<A, B, C, D>> = <<X:32/integer>>,
-            IP = lists:flatten(io_lib:format("~b.~b.~b.~b", [A, B, C, D])),
-            Clean = fun(Q) ->
-                NQ = list_to_binary(lists:sublist(Q, 2, length(Q)-2)),
-                lists:flatten(io_lib:format("~ts", [NQ]))
-            end,
-            ISP = Clean(G),
-            Country = Clean(H),
-            Province = Clean(J),
-            City = Clean(K),
-            County = Clean(L),
-            Args = [IP, ISP, Country, Province, City, County],
-            save(Args),
-            io:fwrite("~b ~s ~ts ~ts ~ts ~ts ~ts~n", [Count | Args]),
-            csv_import(Fd, Count + 1);
-        Err -> Err
-    end.
-
 incr_ips_count() ->
     [{_, Count}] = ets:lookup(?IPS_TABLE, count),
     ets:insert(?IPS_TABLE, {count, Count + 1}).
+
+%% ======== Taobao API ======== %%
+
+taobao_api(IP) ->
+    URL = "http://ip.taobao.com/service/getIpInfo.php?ip=" ++ IP,
+    case httpc:request(get, {URL, []}, [], [{full_result, false}]) of
+        {ok, {200, Json}} ->
+            Decoded = try
+                mochijson2:decode(Json, [{format, proplist}])
+            catch
+                error: _Reason -> error
+            end,
+            case Decoded of
+                [{<<"code">>, 0}, {<<"data">>, Info}] ->
+                    {_, ISP} = lists:keyfind(<<"isp">>, 1, Info),
+                    {_, Country} = lists:keyfind(<<"country">>, 1, Info),
+                    {_, Province} = lists:keyfind(<<"region">>, 1, Info),
+                    {_, City} = lists:keyfind(<<"city">>, 1, Info),
+                    {_, County} = lists:keyfind(<<"county">>, 1, Info),
+                    All = [IP, ISP, Country, Province, City, County],
+                    save(All),
+                    {200, format(All)};
+                _ -> invalid_ip()
+            end;
+        _ -> invalid_ip()
+    end.
+
+%% ======== Snapshot ======== %%
+
+snapshot() ->
+    timer:sleep(?SNAPSHOT_INTV),
+    snapshot_now(),
+    snapshot().
+
+snapshot_now() ->
+    Suffix = time_suffix(),
+    ets:insert(?GEO_TABLE, {?IPS_TABLE, ?IPS_FILE ++ Suffix}),
+    ets:tab2file(?IPS_TABLE, ?IPS_FILE ++ Suffix),
+    ets:tab2file(?GEO_TABLE, ?GEO_FILE ++ Suffix),
+    ets:tab2file(?GEO_TABLE, ?GEO_FILE),
+    ok.
+
+%% ======== HTTP Server ======== %% 
 
 http_response(Code, Json) ->
     Status = case Code of
@@ -311,23 +312,15 @@ http_response(Code, Json) ->
     Date = io_lib:format("Date: ~s, ~b ~s ~b ~b:~b:~b GMT\r\n", Args),
     lists:concat([Status, Date,
                   "Content-Type: application/json\r\n",
-                % "Transfer-Encoding: chunked\r\n",
                   "Connection: close\r\n\r\n",
                   Json]).
-
-id_to_name(ISP_id, Country_id, Province_id, City_id, County_id) ->
-    [{_, ISP}]      = ets:lookup(?GEO_TABLE, {isp_id,      ISP_id}),
-    [{_, Country}]  = ets:lookup(?GEO_TABLE, {country_id,  Country_id}),
-    [{_, Province}] = ets:lookup(?GEO_TABLE, {province_id, Province_id}),
-    [{_, City}]     = ets:lookup(?GEO_TABLE, {city_id,     City_id}),
-    [{_, County}]   = ets:lookup(?GEO_TABLE, {county_id,   County_id}),
-    [ISP, Country, Province, City, County].
 
 format(Args) when is_list(Args) ->
     % [IP, ISP, Country, Province, City, County] = Args
     Unicode = io_lib:format(normal_ip(), Args),
     backslash_u(lists:flatten(Unicode)).
 
+%% Convert utf-8 to "\u" prefix encoding
 backslash_u(L) -> backslash_u(lists:reverse(L), []).
 backslash_u([], L) -> L;
 backslash_u([H|T], L) ->
@@ -364,6 +357,7 @@ multicast_ip(IP) ->
 invalid_ip() ->
     {400, "{\"message\":\"Invalid IP\"}"}.
 
+%% Generate a string like "-20140106-060717"
 time_suffix() ->
     {{Y, M, D}, {H, Mi, S}} = erlang:localtime(),
     Sfx1 = integer_to_list(Y * 10000 + M * 100 + D),
@@ -377,4 +371,38 @@ months() ->
 
 weekdays() ->
     ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].
+
+%% ======== CSV Importer ======== %%
+
+csv_import(Filename) ->
+    {ok, Fd} = file:open(Filename, [raw, read, {read_ahead, 4096}]),
+    % skip the first line
+    file:read_line(Fd),
+    csv_import(Fd, 0).
+
+csv_import(Fd, Count) ->
+    case file:read_line(Fd) of
+        {ok, Line} ->
+            [S, G, H, J, K, L] = string:tokens(Line, ",\n"),
+            X = list_to_integer(S), 
+            <<A, B, C, D>> = <<X:32/integer>>,
+            IP = lists:flatten(io_lib:format("~b.~b.~b.~b", [A, B, C, D])),
+            % remove quotes
+            Clean = fun(Q) ->
+                NQ = list_to_binary(lists:sublist(Q, 2, length(Q)-2)),
+                lists:flatten(io_lib:format("~ts", [NQ]))
+            end,
+            ISP      = Clean(G),
+            Country  = Clean(H),
+            Province = Clean(J),
+            City     = Clean(K),
+            County   = Clean(L),
+            Args = [IP, ISP, Country, Province, City, County],
+            save(Args),
+            io:fwrite("~b ~s ~ts ~ts ~ts ~ts ~ts~n", [Count | Args]),
+            csv_import(Fd, Count + 1);
+        Err ->
+            file:close(Fd),
+            Err
+    end.
 
