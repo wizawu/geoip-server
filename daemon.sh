@@ -1,2 +1,5 @@
 #!/bin/sh
-sudo erl -smp auto +K true -pz ./ebin -detached -run geoip start 80 16
+sudo erl -pz ./ebin \
+         -smp auto +K true \
+         -sname geoip \
+         -detached -run geoip start 80 16

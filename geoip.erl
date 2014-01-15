@@ -39,7 +39,7 @@ init([careful]) ->
     snapshot_now(),
     ets:delete(?IPS_TABLE),
     ets:delete(?GEO_TABLE),
-    ok.
+    halt().
 
 %% Used to start from command line
 start([_Port, _Procs]) when is_list(_Port), is_list(_Procs) ->
